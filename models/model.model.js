@@ -69,6 +69,10 @@ const modelSchema = new mongoose.Schema({
     required: true
   },
   images: [String],
+  modelFileUrl: {
+    type: String,
+    required: [true, 'Model file URL is required.'] // Make it required
+  },
   creator: {
     name: String,
     role: String,

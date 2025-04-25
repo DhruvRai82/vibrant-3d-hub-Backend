@@ -9,13 +9,31 @@ const { memoryUpload } = require('../middleware/upload.middleware');
 const router = express.Router();
 const path = require('path');
 const fs = require('fs');
+const streamifier = require('streamifier'); // Helper for buffer uploads
 
+
+// Helper function for Cloudinary upload (ensure this exists or use SDK directly)
+const uploadToCloudinary = (fileBuffer, options = {}) => {
+  return new Promise((resolve, reject) => {
+      // Add config check here if not done globally
+      if (!cloudinary.config().cloud_name) {
+          return reject(new Error("Cloudinary not configured."));
+      }
+      const uploadStream = cloudinary.uploader.upload_stream(options, (error, result) => {
+      if (error) return reject(error);
+      if (!result) return reject(new Error("Cloudinary returned no result."));
+      resolve(result);
+      });
+      streamifier.createReadStream(fileBuffer).pipe(uploadStream);
+  });
+};
 // Use the upload middleware with proper field configuration
 const upload = memoryUpload.fields([
   { name: 'images', maxCount: 10 },
   { name: 'thumbnail', maxCount: 1 },
-  { name: 'modelFiles', maxCount: 5 }
+  { name: 'modelFiles', maxCount: 1 }
 ]);
+
 
 // Get all models (with optional filtering)
 router.get('/', async (req, res) => {
@@ -93,9 +111,10 @@ router.get('/category/:category', async (req, res) => {
 // Download model file
 router.get('/:id/download', async (req, res) => {
   try {
-    const model = await Model.findById(req.params.id);
+    const model = await Model.findById(req.params.id).select('+modelFileUrl'); // Select the new field
+
     
-    if (!model) {
+    if (!model || !model.modelFileUrl) { // Check if model or URL exists
       return res.status(404).json({ message: 'Model not found' });
     }
     
@@ -104,7 +123,9 @@ router.get('/:id/download', async (req, res) => {
       // In a real app, verify purchase here
       // For demo purposes, we allow download without verification
     }
-    
+    console.log(`Redirecting download for ${req.params.id} to Cloudinary URL: ${model.modelFileUrl}`);
+    res.redirect(302, model.modelFileUrl); // 302 Found redirect
+
     // In a real implementation, you would have a model file stored
     // For demo purposes, we'll send back a sample file
     const sampleFilePath = path.join(__dirname, '../demo-model.glb');
@@ -120,6 +141,8 @@ router.get('/:id/download', async (req, res) => {
     console.error('Error downloading model:', error);
     res.status(500).json({ message: error.message });
   }
+
+  
 });
 
 // Access model file for 3D viewer (likely streaming)
@@ -189,9 +212,13 @@ router.get('/:id', async (req, res) => {
   }
 });
 
+
+
 // Create a new model (admin only)
 router.post('/', [auth, isAdmin], (req, res) => {
   upload(req, res, async function(err) {
+    // Handle file upload errors
+    
     if (err instanceof multer.MulterError) {
       console.error('Multer error:', err);
       return res.status(400).json({ message: `Upload error: ${err.message}` });
@@ -201,6 +228,17 @@ router.post('/', [auth, isAdmin], (req, res) => {
     }
     
     try {
+      console.log("Request Body:", req.body);
+      console.log("Request Files:", req.files); // Log to see what multer provides
+
+      // Check required files
+      if (!req.files || !req.files.thumbnail || req.files.thumbnail.length === 0) {
+          return res.status(400).json({ message: 'Thumbnail file is required.' });
+      }
+      // *** CHECK FOR MODEL FILE ***
+      if (!req.files.modelFiles || req.files.modelFiles.length === 0) {
+          return res.status(400).json({ message: '3D Model file (modelFiles field) is required.' });
+      }
       // Process the request after successful file upload
       const {
         title, description, longDescription, category, price,
@@ -221,13 +259,16 @@ router.post('/', [auth, isAdmin], (req, res) => {
       if (req.files.thumbnail && req.files.thumbnail.length > 0) {
         const thumbnailFile = req.files.thumbnail[0];
         const base64Thumbnail = `data:${thumbnailFile.mimetype};base64,${thumbnailFile.buffer.toString('base64')}`;
-        
-        const thumbnailResult = await cloudinary.uploader.upload(base64Thumbnail, {
-          folder: 'immersive-homes/models'
-        });
-        
+        console.log("Uploading thumbnail...");
+
+        const thumbnailResult = await uploadToCloudinary(thumbnailFile.buffer, {
+          folder: `immersive-homes/models/${category}/thumbnails`, // Example folder structure
+          resource_type: 'image'
+       });
         thumbnail = thumbnailResult.secure_url;
         uploadedImages.push(thumbnail);
+        console.log("Thumbnail uploaded:", thumbnailUrl);
+
       }
       
       // Upload additional images if exist
@@ -242,7 +283,30 @@ router.post('/', [auth, isAdmin], (req, res) => {
           uploadedImages.push(result.secure_url);
         }
       }
-      
+      const uploadedImageUrls = [thumbnailUrl]; // Start with thumbnail
+      if (req.files.images && req.files.images.length > 0) {
+          console.log(`Uploading ${req.files.images.length} additional images...`);
+          for (const file of req.files.images) {
+              const imageResult = await uploadToCloudinary(file.buffer, {
+                  folder: `immersive-homes/models/${category}/images`,
+                  resource_type: 'image'
+              });
+              uploadedImageUrls.push(imageResult.secure_url);
+          }
+          console.log("Additional images uploaded:", uploadedImageUrls.slice(1));
+      }
+
+        // --- *** UPLOAD THE 3D MODEL FILE *** ---
+        const modelFile = req.files.modelFiles[0];
+        console.log("Uploading 3D model file:", modelFile.originalname);
+        const modelFileResult = await uploadToCloudinary(modelFile.buffer, {
+            folder: `immersive-homes/models/${category}/files`, // Separate folder for model files
+            resource_type: 'raw', // IMPORTANT: Use 'raw' for non-image/video like GLB/ZIP etc.
+            public_id: `${title.replace(/[^a-z0-9]/gi, '_')}_${Date.now()}` // Create a unique name
+        });
+        const modelFileUrl = modelFileResult.secure_url; // Get the URL
+        console.log("3D Model file uploaded:", modelFileUrl);
+        // --- *** END 3D FILE UPLOAD *** ---
       // If thumbnail not specifically uploaded, use first image
       if (!thumbnail && uploadedImages.length > 0) {
         thumbnail = uploadedImages[0];
@@ -256,19 +320,16 @@ router.post('/', [auth, isAdmin], (req, res) => {
       
       // Create new model
       const model = new Model({
-        title,
-        description,
-        longDescription,
-        category,
-        price,
-        featured: featured === 'true' || featured === true,
-        status,
-        fileSize,
-        format,
-        version,
-        software,
-        thumbnail,
-        images: uploadedImages,
+        title, description, longDescription, category, price,
+        featured: featured === 'true' || featured === true, status,
+        // Get format/size from uploaded file or body? Prioritize file.
+        fileSize: fileSize || (modelFile.size / (1024*1024)).toFixed(2) + 'MB',
+        format: format || path.extname(modelFile.originalname).toLowerCase(),
+        version: version || '1.0', // Default version?
+        software: software || 'Unknown', // Default software?
+        thumbnail: thumbnailUrl, // From upload
+        images: uploadedImageUrls, // From uploads
+        modelFileUrl: modelFileUrl, // *** STORE THE UPLOADED MODEL URL ***
         creator: {
           name: req.user.name,
           role: 'Lead Architect',
@@ -281,7 +342,9 @@ router.post('/', [auth, isAdmin], (req, res) => {
       });
       
       await model.save();
-      
+      console.log("Model saved to DB:", newModel._id);
+      res.status(201).json(newModel); // Return the created model
+
       res.status(201).json(model);
     } catch (error) {
       console.error('Error creating model:', error);
